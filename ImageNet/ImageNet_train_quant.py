@@ -27,6 +27,8 @@ from feature_quant_module import FeatureQuantizer
 from utils import update_grad_scales
 from utils_distill import define_distill_loss
 
+import numpy as np
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -40,8 +42,7 @@ def str2bool(v):
 # data and model
 parser = argparse.ArgumentParser(description='PyTorch Implementation of EWGS')
 parser.add_argument('--data', metavar='DIR', default='/path/to/ILSVRC2012', help='path to dataset')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18_quant', choices=('resnet18_quant','resnet34_quant'),
-                    help='model architecture')
+parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18_quant', choices=('resnet18_quant','resnet34_quant'), help='model architecture')
 parser.add_argument('-j', '--workers', default=8, type=int, metavar='N', help='number of data loading workers')
 
 
@@ -49,8 +50,8 @@ parser.add_argument('-j', '--workers', default=8, type=int, metavar='N', help='n
 parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=256, type=int, metavar='N', help='mini-batch size (default: 256), this is the total ' 'batch size of all GPUs on the current node when ' 'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--optimizer_m', type=str, default='SGD', choices=('SGD','Adam'), help='optimizer for model paramters')
-parser.add_argument('--optimizer_q', type=str, default='Adam', choices=('SGD','Adam'), help='optimizer for quantizer paramters')
+parser.add_argument('--optimizer_m', type=str, default='SGD', choices=('SGD','Adam'), help='optimizer for model parameters')
+parser.add_argument('--optimizer_q', type=str, default='Adam', choices=('SGD','Adam'), help='optimizer for quantizer parameters')
 parser.add_argument('--lr_scheduler', type=str, default='cosine', choices=('step','cosine'), help='type of the scheduler')
 parser.add_argument('--lr_m', type=float, default=1e-2, help='learning rate for model parameters')
 parser.add_argument('--lr_q', type=float, default=1e-5, help='learning rate for quantizer parameters')
@@ -73,7 +74,7 @@ parser.add_argument('--dist-url', default='tcp://127.0.0.1:23456', type=str, hel
 parser.add_argument('--dist-backend', default='nccl', type=str, choices=('nccl', 'gloo'), help='distributed backend')
 parser.add_argument('--seed', default=None, type=int, help='seed for initializing training. ')
 parser.add_argument('--gpu', default=None, type=int, help='GPU id to use.')
-parser.add_argument('--multiprocessing-distributed', type=str2bool, default=False, help='Use multi-processing distributed training to launch ' 'N processes per node, which has N GPUs. This is the ' 'fastest way to use PyTorch for either single node or ' 'multi node data parallel training')
+parser.add_argument('--multiprocessing-distributed', type=str2bool, default=True, help='Use multi-processing distributed training to launch ' 'N processes per node, which has N GPUs. This is the ' 'fastest way to use PyTorch for either single node or ' 'multi node data parallel training')
 
 # arguments for quantization
 parser.add_argument('--QWeightFlag', type=str2bool, default=True, help='do weight quantization')
@@ -83,7 +84,7 @@ parser.add_argument('--act_levels', type=int, default=2, help='number of activat
 parser.add_argument('--baseline', type=str2bool, default=False, help='training with STE')
 parser.add_argument('--bkwd_scaling_factorW', type=float, default=0.0, help='scaling factor for weights')
 parser.add_argument('--bkwd_scaling_factorA', type=float, default=0.0, help='scaling factor for activations')
-parser.add_argument('--use_hessian', type=str2bool, default=True, help='update scsaling factor using Hessian trace')
+parser.add_argument('--use_hessian', type=str2bool, default=True, help='update scaling factor using Hessian trace')
 parser.add_argument('--update_scales_every', type=int, default=1, help='update interval in terms of epochs')
 parser.add_argument('--visible_gpus', default=None, type=str, help='total GPUs to use')
 
@@ -95,9 +96,10 @@ parser.add_argument('--model_type', type=str, default='student', choices=('stude
 parser.add_argument('--use_student_quant_params', type=str2bool, default=True, help='Enable the use of student quantization parameters during teacher quantization')
 parser.add_argument('--use_adapter', type=str2bool, default=True, help='Enable the use of adapter(connector) for Student model')
 parser.add_argument('--use_adapter_bn', type=str2bool, default=False, help='whether to use batchnorm in adapter')
-parser.add_argument('--distill_loss', type=str, default='L2', choices=('L1', 'L2'), help='Feature Distillation Loss')
+
 
 parser.add_argument('--distill', type=str, default=None, choices=('kd', 'fd'))
+parser.add_argument('--distill_loss', type=str, default='L2', choices=('L1', 'L2'), help='Feature Distillation Loss')
 parser.add_argument('--teacher_arch', type=str, default='resnet18_fp', choices=('resnet18_fp', 'resnet34_fp'), help='teacher model architecture')
 parser.add_argument('--kd_T', type=float, default=4, help='temperature for KD distillation')
 parser.add_argument('--kd_gamma', type=float, default=None, help='weight balance for KD')
@@ -213,7 +215,7 @@ def main_worker(gpu, ngpus_per_node, args):
     model_class_s = globals().get(args.arch)
     model_s = model_class_s(args, pretrained=args.pretrained)
 
-    ### initialze quantizer parameters
+    ### initialize quantizer parameters
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0): # do only at rank=0 process
         init_quant_model(model_s, args, ngpus_per_node)
 
@@ -327,11 +329,12 @@ def main_worker(gpu, ngpus_per_node, args):
             if m.bias is not None:
                 model_params_s.append(m.weight)
                 model_params_s.append(m.bias)
+
     print("# Student total params:", sum(p.numel() for p in trainable_params_s))
     print("# Student trainable model params:", sum(p.numel() for p in model_params_s))
     print("# Student trainable quantizer params:", sum(p.numel() for p in quant_params_s))
     if sum(p.numel() for p in trainable_params_s) != sum(p.numel() for p in model_params_s) + sum(p.numel() for p in quant_params_s):
-        raise Exception('Mismatched number of trainable parmas')
+        raise Exception('Mismatched number of trainable params')
     
     # Teacher model parameters
     trainable_params_t = list(model_t.parameters())
@@ -359,7 +362,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # define loss function (criterion) and optimizer
     criterion_list = define_distill_loss(args)
-
+    
     if args.optimizer_m == 'SGD':
         optimizer_m = torch.optim.SGD(model_params_s, lr=args.lr_m, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=args.nesterov)
     elif args.optimizer_m == 'Adam':
@@ -412,7 +415,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     ### tensorboard
     if args.rank % ngpus_per_node == 0: # do only at rank=0 process
-        writer = SummaryWriter(args.log_dir)
+        writer = SummaryWriter(log_dir=args.log_dir, flush_secs=5, max_queue=20)
     else:
         writer = None
     ###
@@ -444,9 +447,8 @@ def main_worker(gpu, ngpus_per_node, args):
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
+        if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
+            checkpoint_state = {
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model_s.state_dict(),
@@ -454,9 +456,10 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer_m' : optimizer_m.state_dict(),
                 'optimizer_q' : optimizer_q.state_dict(),
                 'scheduler_m' : scheduler_m.state_dict(),
-                'scheduler_q' : scheduler_q.state_dict(),
-            }, is_best, path=args.log_dir)
+                'scheduler_q' : scheduler_q.state_dict()
+            }
 
+            save_checkpoint(checkpoint_state, is_best, path=args.log_dir)
 
 def train(train_loader, model_s, model_t, criterion_list, optimizer_m, optimizer_q, scheduler_m, scheduler_q, epoch, args, writer):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -477,6 +480,34 @@ def train(train_loader, model_s, model_t, criterion_list, optimizer_m, optimizer
 
     end = time.time()
 
+    def _flatten_sample(x, max_elems=200_000):
+        v = x.detach()
+        if not v.is_floating_point():
+            v = v.float()
+        v = v.reshape(-1)
+        if v.numel() > max_elems:
+            idx = torch.randperm(v.numel(), device=v.device)[:max_elems]
+            v = v.index_select(0, idx)
+        mask = torch.isfinite(v)
+        v = (v[mask] if mask.any() else v[:0]).cpu()
+        return v
+
+    def _add_hist_fp(writer, tag, tensor, step, bins=128):
+        v = _flatten_sample(tensor)
+        if v.numel() == 0:
+            return
+        writer.add_histogram(tag, v.numpy(), step, bins=bins)
+
+    def _add_hist_quant(writer, tag, tensor, step, levels):
+        v = _flatten_sample(tensor)
+        if v.numel() == 0:
+            return
+
+        arr = v.numpy()
+        arr = np.clip(arr, 0.0, 1.0)
+        bins = int(levels) if (levels is not None and levels >= 2) else 64
+        writer.add_histogram(tag, arr, step, bins=bins)
+
     for i, (images, target) in enumerate(train_loader):
         
         if args.gpu is not None:
@@ -488,10 +519,7 @@ def train(train_loader, model_s, model_t, criterion_list, optimizer_m, optimizer
         with torch.no_grad():
             output_t, fd_map_t = model_t(images, quant_params)
 
-        criterion_cls = criterion_list[0]
-        criterion_div = criterion_list[1]
-        criterion_fd = criterion_list[2]
-
+        criterion_cls, criterion_div, criterion_fd = criterion_list
         loss_cls = criterion_cls(output_s, target)
         loss_div = criterion_div(output_s, output_t)
         loss_fd = criterion_fd(fd_map_s, fd_map_t)
@@ -509,7 +537,7 @@ def train(train_loader, model_s, model_t, criterion_list, optimizer_m, optimizer
 
         # compute gradient and do SGD step
         optimizer_m.zero_grad()
-        optimizer_q.zero_grad()
+        optimizer_q.zero_grad()        
         loss_total.backward()
         optimizer_m.step()
         optimizer_q.step()
@@ -520,39 +548,82 @@ def train(train_loader, model_s, model_t, criterion_list, optimizer_m, optimizer
 
         if i % args.print_freq == 0:
             if writer is not None: # this only works at rank=0 process
-                writer.add_scalar('train/model_lr', optimizer_m.param_groups[0]['lr'], len(train_loader)*epoch + i)
-                writer.add_scalar('train/quant_lr', optimizer_q.param_groups[0]['lr'], len(train_loader)*epoch + i)
-                writer.add_scalar('train/total_loss(current)', loss_total.item(), len(train_loader)*epoch + i)
-                writer.add_scalar('train/total_loss(average)', losses.avg, len(train_loader)*epoch + i)
-                writer.add_scalar('train/loss_cls(current)', loss_cls.item(), len(train_loader)*epoch + i)
-                writer.add_scalar('train/loss_cls(average)', losses_cls.avg, len(train_loader)*epoch + i)
-                writer.add_scalar('train/loss_kd(current)', loss_div.item(), len(train_loader)*epoch + i)
-                writer.add_scalar('train/loss_kd(average)', losses_div.avg, len(train_loader)*epoch + i)
-                writer.add_scalar('train/loss_fd(current)', loss_fd.item(), len(train_loader)*epoch + i)
-                writer.add_scalar('train/loss_fd(average)', losses_fd.avg, len(train_loader)*epoch + i)
-                writer.add_scalar('train/top1(average)', top1.avg, len(train_loader)*epoch + i)
-                writer.add_scalar('train/top5(average)', top5.avg, len(train_loader)*epoch + i)
+                step = len(train_loader) * epoch + i
+                writer.add_scalar('train/model_lr', optimizer_m.param_groups[0]['lr'], step)
+                writer.add_scalar('train/quant_lr', optimizer_q.param_groups[0]['lr'], step)
+                writer.add_scalar('train/total_loss(current)', loss_total.item(), step)
+                writer.add_scalar('train/total_loss(average)', losses.avg, step)
+                writer.add_scalar('train/loss_cls(current)', loss_cls.item(), step)
+                writer.add_scalar('train/loss_cls(average)', losses_cls.avg, step)
+                writer.add_scalar('train/loss_kd(current)', loss_div.item(), step)
+                writer.add_scalar('train/loss_kd(average)', losses_div.avg, step)
+                writer.add_scalar('train/loss_fd(current)', loss_fd.item(), step)
+                writer.add_scalar('train/loss_fd(average)', losses_fd.avg, step)
+                writer.add_scalar('train/top1(average)', top1.avg, step)
+                writer.add_scalar('train/top5(average)', top5.avg, step)
+
                 num_modules = 1
-                for m in model_s.modules():
+                ms = model_s.module if hasattr(model_s, 'module') else model_s
+                for m in ms.modules():
                     if isinstance(m, QConv):
                         if m.quan_act:
-                            writer.add_scalar('z_{}th_module/lA'.format(num_modules), m.lA.item(), len(train_loader)*epoch + i)
-                            writer.add_scalar('z_{}th_module/uA'.format(num_modules), m.uA.item(), len(train_loader)*epoch + i)
-                            writer.add_scalar('z_{}th_module/bkwd_scaleA'.format(num_modules), m.bkwd_scaling_factorA.item(), len(train_loader)*epoch + i)
+                            writer.add_scalar(f'z_{num_modules}th_module/lA', m.lA.item(), step)
+                            writer.add_scalar(f'z_{num_modules}th_module/uA', m.uA.item(), step)
+                            writer.add_scalar(f'z_{num_modules}th_module/bkwd_scaleA', m.bkwd_scaling_factorA.item(), step)
                         if m.quan_weight:
-                            writer.add_scalar('z_{}th_module/lW'.format(num_modules), m.lW.item(), len(train_loader)*epoch + i)
-                            writer.add_scalar('z_{}th_module/uW'.format(num_modules), m.uW.item(), len(train_loader)*epoch + i)
-                            writer.add_scalar('z_{}th_module/bkwd_scaleW'.format(num_modules), m.bkwd_scaling_factorW.item(), len(train_loader)*epoch + i)
+                            writer.add_scalar(f'z_{num_modules}th_module/lW', m.lW.item(), step)
+                            writer.add_scalar(f'z_{num_modules}th_module/uW', m.uW.item(), step)
+                            writer.add_scalar(f'z_{num_modules}th_module/bkwd_scaleW', m.bkwd_scaling_factorW.item(), step)
                         if m.quan_act or m.quan_weight:
-                            writer.add_scalar('z_{}th_module/output_scale'.format(num_modules), m.output_scale.item(), len(train_loader)*epoch + i)
+                            writer.add_scalar(f'z_{num_modules}th_module/output_scale', m.output_scale.item(), step)
                         num_modules += 1
-                for name, m in model_t.named_modules():
+                mt = model_t.module if hasattr(model_t, 'module') else model_t
+                for name, m in mt.named_modules():
                     if isinstance(m, FeatureQuantizer):
-                        writer.add_scalar(f'teacher_{name}/lF', m.lF.item(), len(train_loader)*epoch + i)
-                        writer.add_scalar(f'teacher_{name}/uF', m.uF.item(), len(train_loader)*epoch + i)
+                        writer.add_scalar(f'teacher_{name}/lF', m.lF.item(), step)
+                        writer.add_scalar(f'teacher_{name}/uF', m.uF.item(), step)
+
+        if writer is not None and (i % (args.print_freq*100) == 0):
+            step_hist = len(train_loader) * epoch + i
+            ms = model_s.module if hasattr(model_s, 'module') else model_s
+            mt = model_t.module if hasattr(model_t, 'module') else model_t
+
+            Ls_s = [ms.layer1, ms.layer2, ms.layer3, ms.layer4]
+            Ls_t = [mt.layer1, mt.layer2, mt.layer3, mt.layer4]
+
+            with torch.no_grad():
+                for li, (Ls, Lt) in enumerate(zip(Ls_s, Ls_t), start=1):
+                    # FP Logging
+                    S_pre = getattr(Ls[-1], 'saved_pre_conv2', None)
+                    if S_pre is not None:
+                        _add_hist_fp(writer, f'L{li}/student_pre_conv2', S_pre, step_hist)
+
+                    T_pre = getattr(Lt[-1], 'saved_pre_conv2', None)
+                    if T_pre is not None:
+                        _add_hist_fp(writer, f'L{li}/teacher_pre_conv2', T_pre, step_hist)
+
+                    # Quant value Logging
+                    sq = getattr(Ls[-1].conv2, 'saved_qact', None)
+                    if sq is not None:
+                        _add_hist_quant(writer, f'L{li}/student_qact', sq, step_hist, levels=getattr(args, 'act_levels', None))
+                
+                if args.use_adapter:
+                    _add_hist_fp(writer, 'L4/student_qact_adapter', fd_map_s, step_hist)
+                
+                if fd_map_t is not None:
+                    _add_hist_quant(writer, f'L4/teacher_quant', fd_map_t, step_hist, levels=getattr(args, 'feature_levels', None))
+
+                if hasattr(ms, 'saved_L4_out'):
+                    _add_hist_fp(writer, 'L4/student_out', ms.saved_L4_out, step_hist)
+                if hasattr(mt, 'saved_L4_out'):
+                    _add_hist_fp(writer, 'L4/teacher_out', mt.saved_L4_out, step_hist)
+                    
+                writer.flush()
+        if i % args.print_freq == 0:
             progress.display(i)
     scheduler_m.step()
     scheduler_q.step()
+
 
 
 def validate(val_loader, model_s, model_t, criterion_list, args, writer, epoch=0):

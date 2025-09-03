@@ -65,7 +65,7 @@ class BasicBlock(nn.Module):
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
-        act_conv2 = out
+        pre_conv2 = out
 
         out = self.conv2(out)
         out = self.bn2(out)
@@ -77,7 +77,7 @@ class BasicBlock(nn.Module):
         out = self.relu(out)
 
         if hasattr(self, 'is_last_block') and self.is_last_block:
-            self.saved_act_conv2 = act_conv2.detach().clone()
+            self.saved_pre_conv2 = pre_conv2.detach().clone()
 
         return out
 
@@ -108,6 +108,7 @@ class QBasicBlock(nn.Module):
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
+        pre_conv2 = out
 
         out = self.conv2(out)
         out = self.bn2(out)
@@ -117,6 +118,9 @@ class QBasicBlock(nn.Module):
 
         out += identity
         out = self.relu(out)
+
+        if hasattr(self, 'is_last_block') and self.is_last_block:
+            self.saved_pre_conv2 = pre_conv2.detach().clone()
 
         return out
 
@@ -264,13 +268,14 @@ class ResNet(nn.Module):
                     nn.init.constant_(m.bn2.weight, 0)
 
         # student model Feature Adapter
-        if args.model_type == 'student' and args.use_adapter:
-            self.adapter = self.build_adapter()
-            print("Add Student Adapter layer")
-        
+        if args.model_type == 'student':
+            if args.use_adapter:
+                self.adapter = self.build_adapter()
+                print("Add Student Adapter layer")
+            
         if args.model_type == 'teacher' and args.QFeatureFlag:
             self.feature_quantizer = FeatureQuantizer(args=args)
-            print("Add Teacher FeatureQuantizer")
+            print(f"Add Teacher Target FeatureQuantizer by {self.feature_quantizer.feature_levels} levels")
 
         self._mark_distill_layer()
 
@@ -317,17 +322,25 @@ class ResNet(nn.Module):
     
     def _mark_distill_layer(self):
         if self.args.model_type == 'teacher':
-            last_block = self.layer4[-1]
-            last_block.is_last_block = True
-            print(f"Successfully Marked Teacher Last Block in Layer4: {last_block}")
+            for L in [self.layer1, self.layer2, self.layer3, self.layer4]:
+                L[-1].is_last_block = True
+                print(f"Successfully Marked Teacher Last Block at Each Layer: {L[-1]}")
+        
+            # last_block = self.layer4[-1]
+            # last_block.is_last_block = True
+            # print(f"Successfully Marked Teacher Last Block in Layer4: {last_block}")
 
         elif self.args.model_type == 'student':
-            last_conv = self.layer4[-1].conv2
-            if hasattr(last_conv, 'act_quantization'):
-                last_conv.is_last_conv = True
-                print(f'Successfully Marked Student Last QConv Layer: {last_conv}')
-            else:
-                print(f"Warning: Last QConv Layer is not Qact instance: {type(last_conv)}")
+            for L in [self.layer1, self.layer2, self.layer3, self.layer4]:
+                if hasattr(L[-1].conv2, 'act_quantization'):
+                    L[-1].conv2.is_last_conv = True
+                L[-1].is_last_block = True
+            # last_conv = self.layer4[-1].conv2
+            # if hasattr(last_conv, 'act_quantization'):
+            #     last_conv.is_last_conv = True
+            #     print(f'Successfully Marked Student Last QConv Layer: {last_conv}')
+            # else:
+            #     print(f"Warning: Last QConv Layer is not Qact instance: {type(last_conv)}")
 
     def build_adapter(self):
         layers = [nn.Conv2d(512, 512, kernel_size=1, stride=1, padding=0, bias=False)]
@@ -363,6 +376,7 @@ class ResNet(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
+        self.saved_L4_out = x.detach().clone()
 
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
@@ -383,8 +397,8 @@ class ResNet(nn.Module):
 
         elif self.args.model_type == 'teacher':
             last_block = self.layer4[-1]
-            if hasattr(last_block, 'saved_act_conv2'):
-                feat_t = last_block.saved_act_conv2
+            if hasattr(last_block, 'saved_pre_conv2'):
+                feat_t = last_block.saved_pre_conv2
 
             fd_map = self.feature_quantizer(feat_t, quant_params=quant_params) if self.args.QFeatureFlag else feat_t
 

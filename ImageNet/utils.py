@@ -38,9 +38,7 @@ def update_grad_scales(args, args_t, criterion_list):
         num_workers=args.workers, pin_memory=True)
     
     ## define loss function
-    criterion_cls = criterion_list[0]
-    criterion_div = criterion_list[1]
-    criterion_fd = criterion_list[2]
+    criterion_cls, criterion_div, criterion_fd = criterion_list
     
     ## load weights from the last checkpoint
     checkpoint = torch.load(os.path.join(args.log_dir, 'checkpoint.pth.tar'))
@@ -67,7 +65,7 @@ def update_grad_scales(args, args_t, criterion_list):
                 scaleW.append(0)
 
     model_s.train()
-    model_t.eval()
+    # model_t.eval()
     with tqdm(total=10, file=sys.stdout) as pbar:
         for num_batches, (images, labels) in enumerate(train_loader):
             if num_batches == 10: # estimate trace using 10 batches
